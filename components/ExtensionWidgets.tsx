@@ -3,6 +3,13 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import type { ExtensionWidgetItem } from "@/lib/types";
+import type { FooterPanelData } from "@/lib/footer-status";
+import { FooterPanel } from "./FooterPanel";
+import {
+  EXTENSION_TAB_LABELS,
+  canonicalExtensionTabId,
+  normalizeExtensionTabOrder,
+} from "@/lib/extension-tab-order";
 
 export const DEFAULT_EXPANDED_WIDGET_LINES = 3;
 export const WIDGET_UPDATE_IDLE_MS = 1100;
@@ -45,7 +52,53 @@ export function getNextExpandedWidgetKey(
   return currentKey === requestedKey ? null : requestedKey;
 }
 
-export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }) {
+/** Widget key for the filechanges extension. */
+const FILECHANGES_WIDGET_KEY = "filechanges";
+
+/**
+ * Parse a filechanges widget line into a structured file entry.
+ * Lines follow the format: `Δ path/to/file.ts (+5/-2)` or `+ path/to/new-file.ts (+10/-0)`
+ * Returns null for non-matching lines (e.g. summary-only lines).
+ */
+export function parseFilechangeLine(
+  line: string,
+): { status: string; path: string; added: number; removed: number } | null {
+  const match = line.match(/^([Δ+])\s+(.+?)\s+\(\+(\d+)\/-([\d]+)\)$/);
+  if (!match) return null;
+  return {
+    status: match[1] === "+" ? "added" : "modified",
+    path: match[2],
+    added: Number(match[3]),
+    removed: Number(match[4]),
+  };
+}
+
+/**
+ * Compute a compact summary string for the filechanges widget trigger.
+ * Example: "Δ 17 files (10 mod / 7 new)" or "Δ 1 file changed".
+ */
+export function computeFileSummary(lines: string[]): string {
+  let modified = 0;
+  let added = 0;
+  for (const line of lines) {
+    const entry = parseFilechangeLine(line);
+    if (!entry) continue;
+    if (entry.status === "added") added++;
+    else modified++;
+  }
+  const total = modified + added;
+  if (total === 0) return "Δ 0 files";
+  const parts: string[] = [];
+  if (modified > 0) parts.push(`${modified} mod`);
+  if (added > 0) parts.push(`${added} new`);
+  return `Δ ${total} file${total === 1 ? "" : "s"} (${parts.join(" / ")})`;
+}
+
+export function ExtensionWidgets({ widgets, footer = null }: {
+  widgets: ExtensionWidgetItem[];
+  /** Optional structured footer panel data (see lib/footer-status.ts). */
+  footer?: FooterPanelData | null;
+}) {
   const { t } = useI18n();
   const idPrefix = useId();
   const previousContentsRef = useRef<Map<string, string[]> | null>(null);
@@ -53,6 +106,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
   const [expandedWidgetKey, setExpandedWidgetKey] = useState<string | null>(
     () => getDefaultExpandedWidgetKey(widgets),
   );
+  const [footerExpanded, setFooterExpanded] = useState(false);
   const [updatingWidgetKeys, setUpdatingWidgetKeys] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -101,16 +155,35 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
     updateClearTimersRef.current.clear();
   }, []);
 
-  if (widgets.length === 0) return null;
+  if (widgets.length === 0 && !footer) return null;
 
   const expandedWidget = widgets.find((widget) => (
     widget.key === expandedWidgetKey
-    && widget.lines.length > 1
+    && widget.lines.length >= 1
   ));
 
   const toggleWidget = (widget: ExtensionWidgetItem) => {
+    setFooterExpanded(false);
     setExpandedWidgetKey((current) => getNextExpandedWidgetKey(current, widget.key));
   };
+
+  const toggleFooter = () => {
+    setExpandedWidgetKey(null);
+    setFooterExpanded((current) => !current);
+  };
+
+  const footerId = `${idPrefix}-trigger-footer`;
+  const footerPanelId = `${idPrefix}-panel-footer`;
+
+  // Deterministic tab order: normal tabs first (relative order preserved),
+  // then the fixed extension tabs in canonical order. Pure + idempotent, so
+  // widget recreation/updates can never move these tabs.
+  const orderedIds = normalizeExtensionTabOrder([
+    ...widgets.map((w) => w.key),
+    ...(footer ? ["details"] : []),
+  ]);
+  const widgetByCanonical = new Map<string, ExtensionWidgetItem>();
+  for (const w of widgets) widgetByCanonical.set(canonicalExtensionTabId(w.key), w);
 
   return (
     <>
@@ -118,7 +191,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
         <div className="extension-widget-panels">
           {(() => {
             const widget = expandedWidget;
-            const index = widgets.indexOf(widget);
+            const index = orderedIds.indexOf(canonicalExtensionTabId(widget.key));
             const triggerId = `${idPrefix}-trigger-${index}`;
             const panelId = `${idPrefix}-panel-${index}`;
             return (
@@ -129,17 +202,85 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
                 aria-labelledby={triggerId}
               >
                 <div className="extension-widget-panel-heading">{widget.key}</div>
-                <pre className="extension-widget-content">
-                  {formatExtensionWidgetContent(widget.lines)}
-                </pre>
+                {widget.key === FILECHANGES_WIDGET_KEY ? (
+                  <div className="extension-widget-content extension-widget-file-list">
+                    {widget.lines.map((line, i) => {
+                      const entry = parseFilechangeLine(line);
+                      return entry ? (
+                        <div key={i} className="extension-widget-file-entry">
+                          <span className="extension-widget-file-status" data-status={entry.status}>
+                            {entry.status === "added" ? "+" : "✎"}
+                          </span>
+                          <span className="extension-widget-file-path">{entry.path}</span>
+                          <span className="extension-widget-file-changes">
+                            +{entry.added}/-{entry.removed}
+                          </span>
+                        </div>
+                      ) : (
+                        <div key={i} className="extension-widget-file-entry">
+                          <span className="extension-widget-file-path">{line}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <pre className="extension-widget-content">
+                    {formatExtensionWidgetContent(widget.lines)}
+                  </pre>
+                )}
               </section>
             );
           })()}
         </div>
       )}
+      {footer && footerExpanded && (
+        <div className="extension-widget-panels">
+          <section
+            id={footerPanelId}
+            className="extension-widget-panel"
+            aria-labelledby={footerId}
+          >
+            <div className="extension-widget-panel-heading">Details</div>
+            <FooterPanel data={footer} />
+          </section>
+        </div>
+      )}
       <div className="extension-widget-triggers" aria-label={t("chat.extensionWidgets")}>
-        {widgets.map((widget, index) => {
-          const expandable = widget.lines.length > 1;
+        {orderedIds.map((id, index) => {
+          if (id === "details") {
+            return (
+              <button
+                key="details"
+                id={footerId}
+                type="button"
+                className={`extension-widget-trigger${footerExpanded ? " is-expanded" : ""}`}
+                aria-controls={footerPanelId}
+                aria-expanded={footerExpanded}
+                title={`Details - ${footerExpanded ? t("i18n.collapse") : t("i18n.expand")}`}
+                onClick={toggleFooter}
+              >
+                <span className="extension-widget-update-pulse" aria-hidden="true" />
+                <span className="extension-widget-placement" aria-hidden="true">
+                  <svg
+                    className="extension-widget-placement-icon"
+                    viewBox="0 0 8 6"
+                    width="8"
+                    height="6"
+                    data-direction="up"
+                    focusable="false"
+                  >
+                    <path d="M4 0l4 6H0z" />
+                  </svg>
+                </span>
+                <span className="extension-widget-key">{EXTENSION_TAB_LABELS["details"]}</span>
+              </button>
+            );
+          }
+
+          const widget = widgetByCanonical.get(id);
+          if (!widget) return null;
+
+          const expandable = widget.lines.length >= 1;
           const expanded = expandable && widget.key === expandedWidget?.key;
           const updating = updatingWidgetKeys.has(widget.key);
           const lineCountLabel = t(
@@ -153,6 +294,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
           );
           const triggerId = `${idPrefix}-trigger-${index}`;
           const panelId = `${idPrefix}-panel-${index}`;
+          const label = EXTENSION_TAB_LABELS[id] ?? widget.key;
           const content = (
             <>
               <span className="extension-widget-update-pulse" aria-hidden="true" />
@@ -172,7 +314,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
                   />
                 </svg>
               </span>
-              <span className="extension-widget-key">{widget.key}</span>
+              <span className="extension-widget-key">{label}</span>
             </>
           );
 
